@@ -70,7 +70,6 @@ from ..utils import (
     check_positional,
     check_unspec_or_constant_args,
     check_unspec_python_args,
-    dict_methods,
     extract_fake_example_value,
     get_fake_value,
     has_torch_function,
@@ -81,7 +80,6 @@ from ..utils import (
     proxy_args_kwargs,
     raise_args_mismatch,
     specialize_symnode,
-    str_methods,
     tensortype_to_dtype,
     unpack_iterable,
 )
@@ -561,7 +559,71 @@ class BaseBuiltinVariable(VariableTracker):
                         tx, type.__repr__(arg.as_python_constant())
                     )
             return generic_repr(tx, arg)
+        result = self._call_unbound_method(tx, name, args, kwargs)
+        if result is not None:
+            return result
         return super().call_method(tx, name, args, kwargs)
+
+    def _call_unbound_method(
+        self,
+        tx: "InstructionTranslatorBase",
+        name: str,
+        args: list[VariableTracker],
+        kwargs: dict[str, VariableTracker],
+    ) -> VariableTracker | None:
+        """Dispatch an unbound method of the wrapped builtin type, if that is
+        what the call is.  Written out (list.copy(lst)) or read out as a value
+        (`copier = list.copy`): CPython looks the descriptor up on the type,
+        checks the receiver against __objclass__, and runs that descriptor's
+        slot on the receiver.  Shared by every builtin type rather than copied
+        per type.
+        """
+        fn = self.as_python_constant()
+        if args and isinstance(fn, type):
+            descriptor = getattr(fn, name, None)
+            if isinstance(
+                descriptor, (types.MethodDescriptorType, types.WrapperDescriptorType)
+            ):
+                obj, rest = args[0], args[1:]
+                try:
+                    obj_type = obj.python_type()
+                except NotImplementedError:
+                    # No type to check the descriptor against; leave the call to
+                    # the receiver rather than graph breaking with a dynamo bug.
+                    return None
+                if not issubclass(obj_type, descriptor.__objclass__):
+                    # descr_check: the descriptor does not apply to this receiver
+                    # type, and dispatching by name would silently run another
+                    # type's method of the same name.
+                    raise_type_error(
+                        tx,
+                        f"descriptor '{name}' for "
+                        f"'{descriptor.__objclass__.__name__}' objects doesn't "
+                        f"apply to a '{obj_type.__name__}' object",
+                    )
+                if isinstance(obj, UserDefinedObjectVariable):
+                    # A user class reaches this call through its own dispatch,
+                    # and call_base_method starts the slot lookup at the builtin
+                    # base rather than the user class, so a Python override of
+                    # the same name never runs in place of the descriptor's
+                    # slot: list.append(OverridingAppend(), 3) appends.
+                    return obj.call_base_method(tx, name, rest, kwargs)
+                # A builtin VT dispatches by name, which is this descriptor's
+                # slot only when the receiver's own type resolves the name back
+                # to the descriptor.  Where another C descriptor shadows it
+                # (OrderedDict.keys) that descriptor's slot is still the right
+                # one, but where a plain attribute shadows it the name belongs
+                # to the receiver's type and running its method here would be
+                # wrong: object.__eq__ is not list/dict/set equality, and
+                # object.__hash__(lst) is the id hash, not list's TypeError.
+                shadow = inspect.getattr_static(obj_type, name, None)
+                if shadow is not descriptor and not isinstance(
+                    shadow,
+                    (types.MethodDescriptorType, types.WrapperDescriptorType),
+                ):
+                    return None
+                return obj.call_method(tx, name, rest, kwargs)
+        return None
 
 
 # Instances of these types cannot carry per-instance attributes, so whether an
@@ -1983,12 +2045,6 @@ class BuiltinVariable(BaseBuiltinVariable):
             # object.__init__ is a no-op
             return variables.ConstantVariable.create(None)
 
-        if self.fn in (set, frozenset, list, tuple, int, str, float, complex):
-            if isinstance(args[0], variables.UserDefinedObjectVariable):
-                return args[0].call_base_method(tx, name, args[1:], kwargs)
-            else:
-                return args[0].call_method(tx, name, args[1:], kwargs)
-
         if (
             name in ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__")
             and len(args) == 2
@@ -2006,13 +2062,6 @@ class BuiltinVariable(BaseBuiltinVariable):
                 return ConstantVariable.create(
                     getattr(self.fn, name)(lval, args[1].as_python_constant())
                 )
-
-        if self.fn is str and len(args) >= 1:
-            resolved_fn = getattr(self.fn, name, None)
-            if resolved_fn in str_methods:
-                # Only delegate to ConstantVariable, not other types that happen to be constants
-                if isinstance(args[0], ConstantVariable):
-                    return args[0].call_method(tx, name, args[1:], kwargs)
 
         if (
             self.fn in (int, float, complex)
@@ -2032,16 +2081,26 @@ class BuiltinVariable(BaseBuiltinVariable):
                 raise_observed_exception(type(e), tx, args=list(e.args))
             return VariableTracker.build(tx, res)
 
-        if name == "__len__" and len(args) == 1 and not kwargs:
-            # type.__len__(instance) → len(instance)
-            # e.g. list.__len__(my_list) → len(my_list)
-            return generic_size(tx, args[0])
-
         if name == "__str__" and len(args) == 1 and not kwargs:
             return super().call_method(tx, name, args, kwargs)
 
         if name == "__repr__" and len(args) == 1 and not kwargs:
             return super().call_method(tx, name, args, kwargs)
+
+        # Must precede the protocol handlers below, which dispatch on the
+        # receiver and so would run a subclass override where this runs the
+        # type's own slot.  The base class repeats this for the builtin VTs that
+        # do not inherit from this one.  Every type those handlers name defines
+        # the slot, so they only run for a type that lacks it: int.__len__(x)
+        # reaches its handler, list.__len__(x) is dispatched here.
+        result = self._call_unbound_method(tx, name, args, kwargs)
+        if result is not None:
+            return result
+
+        if name == "__len__" and len(args) == 1 and not kwargs:
+            # type.__len__(instance) → len(instance)
+            # e.g. list.__len__(my_list) → len(my_list)
+            return generic_size(tx, args[0])
 
         if name == "__iter__" and len(args) == 1 and not kwargs:
             # type.__iter__(instance) → iter(instance)
@@ -3554,13 +3613,6 @@ class DictBuiltinVariable(BaseBuiltinVariable):
                     [],
                     tx=tx,
                 )
-
-        resolved_fn = getattr(dict, name, None)
-        if resolved_fn is not None and resolved_fn in dict_methods:
-            obj = args[0]
-            if isinstance(obj, UserDefinedObjectVariable):
-                return obj.call_base_method(tx, name, args[1:], kwargs)
-            return obj.call_method(tx, name, args[1:], kwargs)
 
         return super().call_method(tx, name, args, kwargs)
 
